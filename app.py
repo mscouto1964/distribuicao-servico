@@ -4,6 +4,7 @@ import zipfile, io, os, re
 
 st.set_page_config(page_title="Distribuição de Serviço Docente", layout="wide")
 
+# ---------------- Sidebar ----------------
 st.sidebar.header("Configuração")
 UNID_MIN = st.sidebar.number_input("Minutos por unidade letiva (2º/3º/Sec)", 45, 90, 50, 5)
 TEIP = st.sidebar.checkbox("Agrupamento TEIP?", value=False)
@@ -247,7 +248,7 @@ def validar_docente(docente):
     grupo = str(docente.get("grupo","")).strip()
     df = horarios[horarios["docente_id"]==d_id].copy()
     if df.empty:
-        return {"alvo":"—","letiva":0,"nlet_est":0,"nlet_ind":0,"issues":["Sem horário atribuído"],"sugestoes":[]}
+        return {"alvo":None,"letiva":0,"nlet_est":0,"nlet_ind":0,"issues":["Sem horário atribuído"],"sugestoes":[]}
     df["min"] = df.apply(lambda r: mins_between(r["inicio"], r["fim"]), axis=1)
     letiva = int(df.loc[df["tipo"]=="LETIVA","min"].sum())
     nlet_est = int(df.loc[df["tipo"]=="NLET_EST","min"].sum())
@@ -299,9 +300,21 @@ def validar_docente(docente):
 st.subheader("Validação por docente")
 for _, d in docentes.iterrows():
     v = validar_docente(d)
-    ok = not v["issues"]
-    color = "✅" if ok else ("🟧" if any("NLet Est" in x for x in v["issues"]) else "🟥")
-    st.markdown(f"**{color} {d['nome']} ({d['grupo']})** — Alvo letiva: {int(v['alvo']//60)}h | Letiva {v['letiva']//60}h{v['letiva']%60:02d} | NLet Est {v['nlet_est']//60}h{v['nlet_est']%60:02d} | NLet Ind {v['nlet_ind']//60}h{v['nlet_ind']%60:02d}")
+    # Safe formatting helpers
+    def fmt_h(m):
+        if m is None: return "—"
+        try:
+            return f"{m//60}h{m%60:02d}"
+        except Exception:
+            return "—"
+    def fmt_alvo(m):
+        if m is None: return "—"
+        try:
+            return f"{int(m//60)}h"
+        except Exception:
+            return "—"
+    color = "✅" if not v["issues"] else ("🟧" if any("NLet Est" in x for x in v["issues"]) else "🟥")
+    st.markdown(f"**{color} {d['nome']} ({d['grupo']})** — Alvo letiva: {fmt_alvo(v['alvo'])} | Letiva {fmt_h(v['letiva'])} | NLet Est {fmt_h(v['nlet_est'])} | NLet Ind {fmt_h(v['nlet_ind'])}")
     if v["issues"]:
         st.write("**Problemas detetados:**")
         for i in v["issues"]:
@@ -311,28 +324,27 @@ for _, d in docentes.iterrows():
         for s in v["sugestoes"]:
             st.write("- ", s)
 
-if isinstance(matriz_raw, pd.DataFrame) and not matriz_raw.empty:
+# Matriz
+if isinstance(matriz, pd.DataFrame) and not matriz.empty:
     st.subheader("Conformidade com a matriz curricular (ciclo + ano + disciplina)")
     letiva = horarios[horarios["tipo"]=="LETIVA"].copy()
     if not letiva.empty:
         letiva["min"] = letiva.apply(lambda r: mins_between(r["inicio"], r["fim"]), axis=1)
+        turma_ciclo = turmas.set_index("id")["ciclo"].to_dict()
+        turma_ano   = turmas.set_index("id")["ano"].to_dict()
         letiva["ciclo"] = letiva["turma_id"].map(lambda t: turma_ciclo.get(t,""))
         letiva["ano"]   = letiva["turma_id"].map(lambda t: turma_ano.get(t,""))
         agg = letiva.groupby(["turma_id","ciclo","ano","disciplina"], dropna=False)["min"].sum().reset_index()
-
-        matriz = smart_rename(matriz_raw, OPTIONAL["matriz"])
         matriz["ciclo"] = matriz["ciclo"].map(normalize_ciclo)
         rep = agg.merge(matriz, how="left", on=["ciclo","ano","disciplina"], suffixes=("","_mat"))
         fb = matriz.groupby(["ciclo","disciplina"])["carga_sem_min"].mean().reset_index().rename(columns={"carga_sem_min":"carga_fallback"})
         rep = rep.merge(fb, how="left", on=["ciclo","disciplina"])
         rep["carga_ref"] = rep["carga_sem_min"].fillna(rep["carga_fallback"])
-
         def estado(row):
             if pd.isna(row["carga_ref"]): return "Sem referência"
             if row["min"] == row["carga_ref"]: return "OK"
             if row["min"] < row["carga_ref"]: return "Parcial"
             return "Excedido"
-
         rep["estado"] = rep.apply(estado, axis=1)
         st.dataframe(rep[["turma_id","ciclo","ano","disciplina","min","carga_ref","estado"]].sort_values(["turma_id","disciplina"]), use_container_width=True)
     else:
@@ -346,4 +358,4 @@ with st.expander("Modelos de ficheiros para download"):
     st.download_button("horarios (modelo)", pd.DataFrame(columns=REQUIRED["horarios"]).to_csv(index=False).encode(), "horarios.csv","text/csv")
     st.download_button("matriz (modelo)",   pd.DataFrame(columns=OPTIONAL["matriz"]).to_csv(index=False).encode(), "matriz.csv","text/csv")
 
-st.caption("Uploads robustos: aceita CSV/Excel; nomes insensíveis a maiúsculas; deteção de separador/codificação; normalização de cabeçalhos.")
+st.caption("Correção: formatação segura quando o alvo não é numérico (sem TypeError). Uploads robustos: CSV/Excel; autodetecção separador/codificação; normalização de cabeçalhos.")
