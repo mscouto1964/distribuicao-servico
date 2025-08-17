@@ -9,13 +9,11 @@ st.set_page_config(page_title="Distribuição de Serviço Docente", layout="wide
 # Robust readers & normalizers
 # ===============================
 def read_csv_robust(file_or_bytes, filename="upload"):
-    """Read CSV trying multiple encodings and separators; return DataFrame or None."""
     if hasattr(file_or_bytes, "read"):
         data = file_or_bytes.read()
     elif isinstance(file_or_bytes, (bytes, bytearray)):
         data = bytes(file_or_bytes)
     else:
-        # assume path
         with open(file_or_bytes, "rb") as f:
             data = f.read()
 
@@ -38,7 +36,6 @@ def read_csv_robust(file_or_bytes, filename="upload"):
 def normalize_ciclo(x):
     if pd.isna(x): return ""
     s = str(x).strip().lower()
-    s = s.replace("º", "º")  # keep ordinal symbol
     if s.startswith(("pré","pre")): return "Pré"
     if s.startswith("1"): return "1º"
     if s.startswith("2"): return "2º"
@@ -50,9 +47,8 @@ def normalize_ano(x):
     if pd.isna(x): return ""
     s = str(x).strip().lower()
     if s.startswith(("pré","pre")): return "Pré"
-    # extrair dígitos (e.g., "1º", "1Âº")
     m = re.search(r"\d+", s)
-    if m: return m.group(0)  # "1","2",...
+    if m: return m.group(0)
     return str(x)
 
 REQUIRED = {
@@ -88,7 +84,7 @@ def load_from_zip(file):
         return {}
 
 # ===============================
-# Defaults (caso não carregue CSVs)
+# Defaults
 # ===============================
 docentes_def = pd.DataFrame([
     {"id":"Pre1","nome":"Ana Silva","grupo":"100","reducao79_min":0},
@@ -133,7 +129,7 @@ validate_schema(docentes, REQUIRED["docentes"], "docentes")
 validate_schema(turmas,   REQUIRED["turmas"],   "turmas")
 validate_schema(matriz,   REQUIRED["matriz"],   "matriz")
 
-# Normalização de texto
+# Normalização
 turmas["ciclo"] = turmas["ciclo"].map(normalize_ciclo)
 turmas["ano"]   = turmas["ano"].map(normalize_ano)
 matriz["ciclo"] = matriz["ciclo"].map(normalize_ciclo)
@@ -151,7 +147,7 @@ def assignments_df():
     return pd.DataFrame(st.session_state.assignments)
 
 # ===============================
-# Sidebar: Filtros e Turma
+# Sidebar: Professores, filtros, modo
 # ===============================
 st.sidebar.markdown("### Professores")
 grupos = ["Todos"] + sorted(docentes["grupo"].astype(str).unique().tolist())
@@ -167,100 +163,203 @@ for _, r in docentes_view.iterrows():
     st.sidebar.write(f"**{r['id']}** — {r['nome']} ({r['grupo']})")
 
 st.sidebar.markdown("---")
-st.sidebar.markdown("### Turmas")
-turma_sel = st.sidebar.selectbox("Selecionar turma", options=list(turmas["id"].astype(str)))
-
-turma_row = turmas[turmas["id"].astype(str)==str(turma_sel)].iloc[0]
-ciclo_sel, ano_sel = turma_row["ciclo"], turma_row["ano"]
-
-disciplinas_turma = matriz[(matriz["ciclo"]==ciclo_sel) & (matriz["ano"]==ano_sel)]["disciplina"].dropna().astype(str).tolist()
-if not disciplinas_turma:
-    st.sidebar.info("Não há disciplinas definidas na matriz para esta turma (ciclo+ano).")
+modo = st.sidebar.radio("Modo de trabalho", options=["Por turma","Por docente","Resumo"], index=0)
 
 # ===============================
-# Main: Editor por Tabela
+# Por turma
 # ===============================
-st.title("Distribuição de Serviço — Atribuição por Tabela (Robusto)")
+if modo == "Por turma":
+    st.title("Distribuição de Serviço — Por Turma")
+    turma_sel = st.sidebar.selectbox("Selecionar turma", options=list(turmas["id"].astype(str)))
+    turma_row = turmas[turmas["id"].astype(str)==str(turma_sel)].iloc[0]
+    ciclo_sel, ano_sel = turma_row["ciclo"], turma_row["ano"]
 
-st.write(f"**Turma selecionada:** {turma_sel} — {ciclo_sel} (ano: {ano_sel})")
-ass = assignments_df()
-mapa_doc = {r["id"]: f"{r['id']} — {r['nome']}" for _, r in docentes.iterrows()}
-opcoes = [""] + list(mapa_doc.keys())
+    disciplinas_turma = matriz[(matriz["ciclo"]==ciclo_sel) & (matriz["ano"]==ano_sel)]["disciplina"].dropna().astype(str).tolist()
+    if not disciplinas_turma:
+        st.info("Não há disciplinas definidas na matriz para esta turma (ciclo+ano).")
 
-t = pd.DataFrame({"disciplina": disciplinas_turma})
-ja = ass[ass["turma_id"]==turma_sel].set_index("disciplina")["docente_id"].to_dict()
-t["docente_id"] = t["disciplina"].map(ja).fillna("")
+    st.write(f"**Turma selecionada:** {turma_sel} — {ciclo_sel} (ano: {ano_sel})")
+    ass = assignments_df()
+    mapa_doc = {r["id"]: f"{r['id']} — {r['nome']}" for _, r in docentes.iterrows()}
+    opcoes = [""] + list(mapa_doc.keys())
 
-edited = st.data_editor(
-    t,
-    column_config={
-        "docente_id": st.column_config.SelectboxColumn(
-            "Docente",
-            options=opcoes,
-            required=False
-        )
-    },
-    use_container_width=True,
-    hide_index=True,
-    num_rows="fixed"
-)
+    t = pd.DataFrame({"disciplina": disciplinas_turma})
+    ja = ass[ass["turma_id"]==turma_sel].set_index("disciplina")["docente_id"].to_dict()
+    t["docente_id"] = t["disciplina"].map(ja).fillna("")
 
-cA, cB, cC = st.columns([1,1,2])
-with cA:
-    if st.button("Guardar atribuições da turma", type="primary"):
-        df = assignments_df()
-        df = df[df["turma_id"]!=turma_sel].copy()
-        novas = []
+    edited = st.data_editor(
+        t,
+        column_config={
+            "docente_id": st.column_config.SelectboxColumn("Docente", options=opcoes, required=False)
+        },
+        use_container_width=True, hide_index=True, num_rows="fixed"
+    )
+
+    cA, cB, cC = st.columns([1,1,2])
+    with cA:
+        if st.button("Guardar atribuições da turma", type="primary"):
+            df = assignments_df()
+            df = df[df["turma_id"]!=turma_sel].copy()
+            novas = []
+            for _, r in edited.iterrows():
+                did = str(r["docente_id"]).strip()
+                if did == "": continue
+                novas.append({"turma_id": turma_sel, "ciclo": ciclo_sel, "ano": ano_sel, "disciplina": r["disciplina"], "docente_id": did})
+            if novas:
+                df = pd.concat([df, pd.DataFrame(novas)], ignore_index=True)
+            st.session_state.assignments = df.to_dict(orient="records")
+            st.success("Atribuições guardadas.")
+    with cB:
+        if st.button("Limpar atribuições da turma"):
+            df = assignments_df()
+            df = df[df["turma_id"]!=turma_sel].copy()
+            st.session_state.assignments = df.to_dict(orient="records")
+            st.info("Atribuições da turma removidas.")
+    with cC:
+        cols = [""] + docentes["id"].astype(str).tolist()
+        destinatario = st.selectbox("Atribuir TODAS as disciplinas da turma a…", options=cols, index=0)
+        if st.button("Aplicar atribuição total"):
+            if destinatario != "":
+                novas = [{"turma_id": turma_sel, "ciclo": ciclo_sel, "ano": ano_sel, "disciplina": d, "docente_id": destinatario} for d in disciplinas_turma]
+                st.session_state.assignments = [r for r in st.session_state.assignments if r["turma_id"]!=turma_sel] + novas
+                st.success(f"Todas as disciplinas da turma {turma_sel} atribuídas a {destinatario}.")
+            else:
+                st.warning("Escolha um docente.")
+
+    st.subheader(f"{turma_sel}: Disciplinas e docente atribuído")
+    out_df = assignments_df()
+    turma_matrix = pd.DataFrame({"disciplina": disciplinas_turma})
+    turma_matrix["docente_id"] = turma_matrix["disciplina"].map(out_df[out_df["turma_id"]==turma_sel].set_index("disciplina")["docente_id"].to_dict()).fillna("")
+    st.dataframe(turma_matrix, use_container_width=True)
+
+# ===============================
+# Por docente
+# ===============================
+elif modo == "Por docente":
+    st.title("Distribuição de Serviço — Por Docente")
+    docentes_opts = docentes["id"].astype(str).tolist()
+    docente_sel = st.sidebar.selectbox("Selecionar docente", options=docentes_opts)
+
+    td = turmas.merge(matriz, how="left", on=["ciclo","ano"])
+    td = td[["id","ciclo","ano","disciplina","carga_sem_min"]].dropna(subset=["disciplina"])
+    td = td.rename(columns={"id":"turma_id"}).reset_index(drop=True)
+
+    ass = assignments_df()
+    ass_map = ass.set_index(["turma_id","disciplina"])["docente_id"].to_dict()
+    td["atribuido_a"] = td.apply(lambda r: ass_map.get((str(r["turma_id"]), str(r["disciplina"])), ""), axis=1)
+
+    fcol1, fcol2, fcol3 = st.columns(3)
+    with fcol1:
+        filtro_turma = st.text_input("Filtrar por turma (contém)", "")
+    with fcol2:
+        filtro_ano = st.text_input("Filtrar por ano (ex.: 7, 10, Pré)", "")
+    with fcol3:
+        filtro_disc = st.text_input("Filtrar por disciplina (contém)", "")
+
+    def contains(s, sub):
+        if not sub: return True
+        return sub.lower() in str(s).lower()
+
+    view = td[td.apply(lambda r: contains(r["turma_id"], filtro_turma) and contains(r["ano"], filtro_ano) and contains(r["disciplina"], filtro_disc), axis=1)].copy()
+
+    view["atribuir"] = view.apply(lambda r: r["atribuido_a"] == docente_sel, axis=1)
+    edited = st.data_editor(
+        view,
+        column_config={
+            "atribuir": st.column_config.CheckboxColumn("Atribuir ao docente selecionado"),
+        },
+        hide_index=True,
+        use_container_width=True
+    )
+
+    if st.button("Guardar atribuições do docente", type="primary"):
+        ass_new = ass.copy()
+        to_keep = []
+        for _, r in ass_new.iterrows():
+            key = (r["turma_id"], r["disciplina"])
+            match = edited[(edited["turma_id"]==r["turma_id"]) & (edited["disciplina"]==r["disciplina"])]
+            if len(match)>0 and not bool(match.iloc[0]["atribuir"]) and r["docente_id"]==docente_sel:
+                continue
+            to_keep.append(r)
+        ass_new = pd.DataFrame(to_keep) if to_keep else pd.DataFrame(columns=ass.columns)
+
         for _, r in edited.iterrows():
-            did = str(r["docente_id"]).strip()
-            if did == "": continue
-            novas.append({"turma_id": turma_sel, "ciclo": ciclo_sel, "ano": ano_sel, "disciplina": r["disciplina"], "docente_id": did})
-        if novas:
-            df = pd.concat([df, pd.DataFrame(novas)], ignore_index=True)
-        st.session_state.assignments = df.to_dict(orient="records")
-        st.success("Atribuições guardadas.")
-with cB:
-    if st.button("Limpar atribuições da turma"):
-        df = assignments_df()
-        df = df[df["turma_id"]!=turma_sel].copy()
-        st.session_state.assignments = df.to_dict(orient="records")
-        st.info("Atribuições da turma removidas.")
-with cC:
-    cols = [""] + docentes["id"].astype(str).tolist()
-    destinatario = st.selectbox("Atribuir TODAS as disciplinas da turma a…", options=cols, index=0)
-    if st.button("Aplicar atribuição total"):
-        if destinatario != "":
-            novas = [{"turma_id": turma_sel, "ciclo": ciclo_sel, "ano": ano_sel, "disciplina": d, "docente_id": destinatario} for d in disciplinas_turma]
-            st.session_state.assignments = [r for r in st.session_state.assignments if r["turma_id"]!=turma_sel] + novas
-            st.success(f"Todas as disciplinas da turma {turma_sel} atribuídas a {destinatario}.")
-        else:
-            st.warning("Escolha um docente.")
+            if bool(r["atribuir"]):
+                ass_new = ass_new[~((ass_new["turma_id"]==r["turma_id"]) & (ass_new["disciplina"]==r["disciplina"]))]
+                ass_new = pd.concat([ass_new, pd.DataFrame([{
+                    "turma_id": r["turma_id"],
+                    "ciclo": r["ciclo"],
+                    "ano": r["ano"],
+                    "disciplina": r["disciplina"],
+                    "docente_id": docente_sel
+                }])], ignore_index=True)
+        st.session_state.assignments = ass_new.to_dict(orient="records")
+        st.success("Atribuições atualizadas.")
+
+    st.subheader(f"Atribuições do docente {docente_sel}")
+    ass_doc = assignments_df()
+    st.dataframe(ass_doc[ass_doc["docente_id"]==docente_sel].sort_values(["turma_id","disciplina"]), use_container_width=True)
 
 # ===============================
-# Output
+# Resumo com badges
 # ===============================
-st.subheader("Atribuições atuais (todas as turmas)")
-out_df = assignments_df().sort_values(["turma_id","disciplina"]).reset_index(drop=True)
-st.dataframe(out_df, use_container_width=True)
+else:
+    st.title("Resumo das Atribuições — com Badges")
 
-st.subheader(f"{turma_sel}: Disciplinas e docente atribuído")
-turma_matrix = pd.DataFrame({"disciplina": disciplinas_turma})
-turma_matrix["docente_id"] = turma_matrix["disciplina"].map(out_df[out_df["turma_id"]==turma_sel].set_index("disciplina")["docente_id"].to_dict()).fillna("")
-st.dataframe(turma_matrix, use_container_width=True)
+    out_df = assignments_df()
+    base = turmas.merge(matriz, how="left", on=["ciclo","ano"])
+    base = base[["id","ciclo","ano","disciplina"]].dropna(subset=["disciplina"]).rename(columns={"id":"turma_id"})
+    who = out_df.set_index(["turma_id","disciplina"])["docente_id"].to_dict()
+    base["atribuido_a"] = base.apply(lambda r: who.get((str(r["turma_id"]), str(r["disciplina"])), ""), axis=1)
+    base["estado"] = base["atribuido_a"].apply(lambda x: "Atribuída" if str(x).strip()!="" else "Por atribuir")
+
+    tab1, tab2 = st.tabs(["Por ano de escolaridade","Por disciplina"])
+
+    with tab1:
+        st.subheader("Visão por ano de escolaridade")
+        cts = base.groupby("ano").agg(
+            total=("disciplina","count"),
+            por_atribuir=("estado", lambda s: (s=="Por atribuir").sum())
+        ).reset_index()
+        st.markdown("**Badges:** *por atribuir / total*")
+        cols = st.columns(len(cts)) if len(cts)>0 else []
+        for col, (_, row) in zip(cols, cts.iterrows()):
+            col.metric(label=f"Ano {row['ano']}", value=f"{int(row['por_atribuir'])}", delta=f"de {int(row['total'])}")
+
+        anos = ["Todos"] + list(pd.unique(base["ano"]))
+        ano_sel = st.selectbox("Filtrar ano", options=anos, index=0)
+        view = base if ano_sel=="Todos" else base[base["ano"]==ano_sel]
+        st.dataframe(view.sort_values(["ano","turma_id","disciplina"]), use_container_width=True)
+
+    with tab2:
+        st.subheader("Visão por disciplina")
+        cts = base.groupby("disciplina").agg(
+            total=("turma_id","count"),
+            por_atribuir=("estado", lambda s: (s=="Por atribuir").sum())
+        ).reset_index().sort_values("disciplina")
+        st.markdown("**Badges:** *por atribuir / total*")
+        for i in range(0, len(cts), 4):
+            row = cts.iloc[i:i+4]
+            cols = st.columns(len(row))
+            for col, (_, r) in zip(cols, row.iterrows()):
+                col.metric(label=str(r["disciplina"]), value=f"{int(r['por_atribuir'])}", delta=f"de {int(r['total'])}")
+        dis = ["Todos"] + cts["disciplina"].astype(str).tolist()
+        disc_sel = st.selectbox("Filtrar disciplina", options=dis, index=0)
+        view = base if disc_sel=="Todos" else base[base["disciplina"]==disc_sel]
+        st.dataframe(view.sort_values(["disciplina","turma_id"]), use_container_width=True)
 
 # ===============================
-# Regras & contadores por docente
+# Cargas por docente e regras
 # ===============================
 st.markdown("---")
 st.header("Cargas por docente e conformidade de regras")
-
-if out_df.empty:
+out_df_all = assignments_df()
+if out_df_all.empty:
     st.info("Sem atribuições ainda.")
 else:
     mat_key = matriz[["ciclo","ano","disciplina","carga_sem_min"]].drop_duplicates()
-    rep = out_df.merge(mat_key, how="left", on=["ciclo","ano","disciplina"])
+    rep = out_df_all.merge(mat_key, how="left", on=["ciclo","ano","disciplina"])
     rep["carga_sem_min"] = pd.to_numeric(rep["carga_sem_min"], errors="coerce").fillna(0).astype(int)
-
     carga_por_doc = rep.groupby("docente_id")["carga_sem_min"].sum().reset_index().rename(columns={"carga_sem_min":"letiva_min"})
     carga_por_doc = carga_por_doc.merge(docentes[["id","nome","grupo"]], left_on="docente_id", right_on="id", how="left")
     carga_por_doc["alvo"] = carga_por_doc["grupo"].astype(str).apply(lambda g: 1500 if g in ["100","110"] else 1100)
@@ -300,6 +399,7 @@ else:
 st.markdown("---")
 c1, c2 = st.columns(2)
 with c1:
+    out_df = assignments_df()
     st.download_button("Descarregar distribuição (CSV)", out_df.to_csv(index=False).encode("utf-8"), "distribuicao_servico.csv", "text/csv")
 with c2:
     up_dist = st.file_uploader("Repor distribuição a partir de CSV (turma_id,ciclo,ano,disciplina,docente_id)", type=["csv"], key="dist_up")
