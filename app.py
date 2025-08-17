@@ -1,7 +1,7 @@
 
 import streamlit as st
 import pandas as pd
-from streamlit_sortables import sort_items
+from streamlit_drag_and_drop_lists import dnd
 import io, zipfile
 
 st.set_page_config(page_title="Distribuição de Serviço Docente", layout="wide")
@@ -100,7 +100,6 @@ matriz["ciclo"] = matriz["ciclo"].map(normalize_ciclo)
 
 # ===============================
 # Session state: distribution model
-# assignments: list of dicts {turma_id, ciclo, ano, disciplina, docente_id}
 # ===============================
 if "assignments" not in st.session_state:
     st.session_state.assignments = []
@@ -109,21 +108,6 @@ def current_assignments_df():
     if not st.session_state.assignments:
         return pd.DataFrame(columns=["turma_id","ciclo","ano","disciplina","docente_id"])
     return pd.DataFrame(st.session_state.assignments)
-
-def set_assignment(turma_id, ciclo, ano, disciplina, docente_id):
-    df = current_assignments_df()
-    # remove any existing row for (turma,disciplina)
-    df = df[~((df["turma_id"]==turma_id) & (df["disciplina"]==disciplina))].copy()
-    # add new
-    df = pd.concat([df, pd.DataFrame([{
-        "turma_id":turma_id,"ciclo":ciclo,"ano":ano,"disciplina":disciplina,"docente_id":docente_id
-    }])], ignore_index=True)
-    st.session_state.assignments = df.to_dict(orient="records")
-
-def unassign(turma_id, disciplina):
-    df = current_assignments_df()
-    df = df[~((df["turma_id"]==turma_id) & (df["disciplina"]==disciplina))].copy()
-    st.session_state.assignments = df.to_dict(orient="records")
 
 # ===============================
 # Sidebar: Professores + Turmas + Disciplinas
@@ -153,55 +137,38 @@ for d in disciplinas_turma:
     st.sidebar.write("- ", d)
 
 # ===============================
-# Main: Drag & drop interface
+# Main: Drag & drop interface (streamlit-drag-and-drop-lists)
 # ===============================
 st.title("Distribuição de Serviço — Drag & Drop")
 
-# Build lists for DnD
-# List 0: Por atribuir (da turma selecionada)
 ass_df = current_assignments_df()
 already = set(ass_df.loc[ass_df["turma_id"]==turma_sel, "disciplina"].tolist())
 por_atribuir = [f"{turma_sel} · {disc}" for disc in disciplinas_turma if disc not in already]
 
-# One list per docente: items assigned a ele (de todas as turmas)
-listas = []
-labels = ["Por atribuir"] + [f"{row['id']} — {row['nome']}" for _, row in docentes.iterrows()]
-
-# Inicial items: build per-teacher lists showing items currently assigned
-doc_lists = {}
+# Build items structure for component
+containers = [
+    {"header": "Por atribuir", "items": por_atribuir},
+]
 for _, row in docentes.iterrows():
     did = row["id"]
     mine = ass_df[ass_df["docente_id"]==did]
     items = [f"{r.turma_id} · {r.disciplina}" for r in mine.itertuples(index=False)]
-    doc_lists[did] = items
+    containers.append({
+        "header": f"{did} — {row['nome']}",
+        "items": items
+    })
 
-listas = [por_atribuir] + list(doc_lists.values())
+results = dnd(containers, direction="horizontal")
 
-st.caption("Arraste uma disciplina da lista *Por atribuir* para o professor pretendido. Itens mostram 'TURMA · DISCIPLINA'.")
-
-new_lists = sort_items(
-    lists=listas,
-    direction="horizontal",
-    min_height=300,
-    # styles
-    stylesheet="""
-    .sortable {background: #f8fafc; padding: 10px; border-radius: 12px; min-height: 280px;}
-    .item {background: white; padding: 8px 10px; border-radius: 10px; margin-bottom: 8px; border: 1px solid #e5e7eb;}
-    """,
-    list_labels=labels
-)
-
-# Interpret changes: compare old vs new
-# new_lists[0] = Por atribuir; new_lists[i] = docente i-1
-if new_lists is not None:
-    # rebuild assignments from lists 1..n
+# If results is not None, rebuild assignments from it
+if results:
+    # results is list of dicts with headers and items
     new_assignments = []
-    for i, (_, row) in enumerate(docentes.iterrows(), start=1):
-        did = row["id"]
-        items = new_lists[i]
-        for it in items:
+    for cont in results[1:]:  # skip "Por atribuir"
+        header = cont["header"]
+        did = header.split("—")[0].strip()
+        for it in cont["items"]:
             turma_id, disc = [x.strip() for x in it.split("·",1)]
-            # fetch ciclo/ano from turmas
             trow = turmas[turmas["id"].astype(str)==str(turma_id)].iloc[0]
             new_assignments.append({
                 "turma_id": turma_id,
@@ -219,13 +186,11 @@ st.subheader("Atribuições atuais")
 out_df = current_assignments_df().sort_values(["turma_id","disciplina"]).reset_index(drop=True)
 st.dataframe(out_df, use_container_width=True)
 
-# Tabela de turmas × disciplinas com docente atribuído (id)
 st.subheader(f"Turma {turma_sel}: Disciplinas e docente atribuído")
 turma_matrix = pd.DataFrame({"disciplina": disciplinas_turma})
 turma_matrix["docente_id"] = turma_matrix["disciplina"].map(
     out_df[out_df["turma_id"]==turma_sel].set_index("disciplina")["docente_id"].to_dict()
 ).fillna("")
-
 st.dataframe(turma_matrix, use_container_width=True)
 
 # ===============================
@@ -244,7 +209,6 @@ with c2:
     if up_dist is not None:
         try:
             imp = pd.read_csv(up_dist)
-            # valida cols
             needed = ["turma_id","ciclo","ano","disciplina","docente_id"]
             if all(c in imp.columns for c in needed):
                 st.session_state.assignments = imp[needed].to_dict(orient="records")
