@@ -1,3 +1,4 @@
+
 import streamlit as st
 import pandas as pd
 import zipfile, io, os, re
@@ -33,6 +34,16 @@ def normalize_ciclo(x: str):
     if t.startswith("3"): return "3º"
     if t.startswith("sec") or "secund" in t: return "Sec"
     return x
+
+def norm_text(s):
+    try:
+        s = str(s)
+    except Exception:
+        return ""
+    s = s.strip().lower()
+    # remover acentos básicos
+    trans = str.maketrans("áàãâéêíóôõúç", "aaaaeeiooouc")
+    return s.translate(trans)
 
 def mins_between(h1, h2):
     try:
@@ -92,7 +103,7 @@ def read_table_from_bytes(data: bytes, filename: str):
             st.error(f"Erro a ler Excel {filename}: {e}")
             return None
     encodings = ["utf-8", "utf-8-sig", "cp1252", "latin-1"]
-    seps = [None, ";", ",", "\t", "|"]
+    seps = [None, ";", ",", "\\t", "|"]
     for enc in encodings:
         for sep in seps:
             try:
@@ -192,11 +203,13 @@ funcoes_raw  = uploaded.get("funcoes", funcoes_def)
 horarios_raw = uploaded.get("horarios", horarios_def)
 matriz_raw   = uploaded.get("matriz", matriz_def)
 
+# Normalize ciclo and text
 if "ciclo" in turmas_raw.columns:
     turmas_raw["ciclo"] = turmas_raw["ciclo"].map(normalize_ciclo)
 if "ciclo" in matriz_raw.columns:
     matriz_raw["ciclo"] = matriz_raw["ciclo"].map(normalize_ciclo)
 
+# Smart rename & schema check
 problems = []
 docentes_miss, docentes = validate_schema(docentes_raw, "docentes")
 turmas_miss,   turmas   = validate_schema(turmas_raw, "turmas")
@@ -233,7 +246,7 @@ dt_horas = funcoes.query("tipo=='DT'")["horas_sem"].sum() if not funcoes.empty e
 ch_usado = max(0, dt_horas*0.5)
 ch_saldo = CH_calc - ch_usado
 
-st.title("Distribuição de Serviço Docente — Versão Robusta (uploads)")
+st.title("Distribuição de Serviço Docente — Versão Robusta (merge fix)")
 m1, m2, m3, m4 = st.columns(4)
 m1.metric("N.º turmas", n_turmas)
 m2.metric("Crédito Horário (estim.)", f"{CH_calc:.1f} h/sem")
@@ -300,7 +313,6 @@ def validar_docente(docente):
 st.subheader("Validação por docente")
 for _, d in docentes.iterrows():
     v = validar_docente(d)
-    # Safe formatting helpers
     def fmt_h(m):
         if m is None: return "—"
         try:
@@ -324,29 +336,43 @@ for _, d in docentes.iterrows():
         for s in v["sugestoes"]:
             st.write("- ", s)
 
-# Matriz
+# ------------- Matriz com normalização forte (evita ValueError no merge) -------------
 if isinstance(matriz, pd.DataFrame) and not matriz.empty:
     st.subheader("Conformidade com a matriz curricular (ciclo + ano + disciplina)")
     letiva = horarios[horarios["tipo"]=="LETIVA"].copy()
     if not letiva.empty:
         letiva["min"] = letiva.apply(lambda r: mins_between(r["inicio"], r["fim"]), axis=1)
-        turma_ciclo = turmas.set_index("id")["ciclo"].to_dict()
-        turma_ano   = turmas.set_index("id")["ano"].to_dict()
-        letiva["ciclo"] = letiva["turma_id"].map(lambda t: turma_ciclo.get(t,""))
-        letiva["ano"]   = letiva["turma_id"].map(lambda t: turma_ano.get(t,""))
+        turma_ciclo_map = turmas.set_index("id")["ciclo"].to_dict()
+        turma_ano_map   = turmas.set_index("id")["ano"].to_dict()
+
+        letiva["ciclo"] = letiva["turma_id"].map(lambda t: turma_ciclo_map.get(t,""))
+        letiva["ano"]   = letiva["turma_id"].map(lambda t: turma_ano_map.get(t,""))
+        letiva["disciplina"] = letiva["disciplina"].map(norm_text)
+
+        # Coerção de tipos para merge seguro
+        letiva["ano"] = pd.to_numeric(letiva["ano"], errors="coerce").astype("Int64")
+        matriz["ano"] = pd.to_numeric(matriz["ano"], errors="coerce").astype("Int64")
+        matriz["disciplina"] = matriz["disciplina"].map(norm_text)
+
+        # Merge exato
         agg = letiva.groupby(["turma_id","ciclo","ano","disciplina"], dropna=False)["min"].sum().reset_index()
-        matriz["ciclo"] = matriz["ciclo"].map(normalize_ciclo)
         rep = agg.merge(matriz, how="left", on=["ciclo","ano","disciplina"], suffixes=("","_mat"))
+
+        # Fallback ciclo+disciplina (ignorando ano)
         fb = matriz.groupby(["ciclo","disciplina"])["carga_sem_min"].mean().reset_index().rename(columns={"carga_sem_min":"carga_fallback"})
         rep = rep.merge(fb, how="left", on=["ciclo","disciplina"])
+
         rep["carga_ref"] = rep["carga_sem_min"].fillna(rep["carga_fallback"])
+
         def estado(row):
             if pd.isna(row["carga_ref"]): return "Sem referência"
             if row["min"] == row["carga_ref"]: return "OK"
             if row["min"] < row["carga_ref"]: return "Parcial"
             return "Excedido"
+
         rep["estado"] = rep.apply(estado, axis=1)
-        st.dataframe(rep[["turma_id","ciclo","ano","disciplina","min","carga_ref","estado"]].sort_values(["turma_id","disciplina"]), use_container_width=True)
+        show = rep[["turma_id","ciclo","ano","disciplina","min","carga_ref","estado"]].sort_values(["turma_id","disciplina"])
+        st.dataframe(show, use_container_width=True)
     else:
         st.info("Sem registos letivos para verificar a matriz.")
 
@@ -358,4 +384,4 @@ with st.expander("Modelos de ficheiros para download"):
     st.download_button("horarios (modelo)", pd.DataFrame(columns=REQUIRED["horarios"]).to_csv(index=False).encode(), "horarios.csv","text/csv")
     st.download_button("matriz (modelo)",   pd.DataFrame(columns=OPTIONAL["matriz"]).to_csv(index=False).encode(), "matriz.csv","text/csv")
 
-st.caption("Correção: formatação segura quando o alvo não é numérico (sem TypeError). Uploads robustos: CSV/Excel; autodetecção separador/codificação; normalização de cabeçalhos.")
+st.caption("Correção de merge: normalização de 'ano' para Int64 e 'disciplina' em minúsculas sem acentos antes do merge. Evita ValueError por tipos diferentes.")
