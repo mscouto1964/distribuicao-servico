@@ -1,13 +1,9 @@
-
 import streamlit as st
 import pandas as pd
-import zipfile, io
+import zipfile, io, os, re
 
 st.set_page_config(page_title="Distribuição de Serviço Docente", layout="wide")
 
-# ============================================================
-# Config Sidebar
-# ============================================================
 st.sidebar.header("Configuração")
 UNID_MIN = st.sidebar.number_input("Minutos por unidade letiva (2º/3º/Sec)", 45, 90, 50, 5)
 TEIP = st.sidebar.checkbox("Agrupamento TEIP?", value=False)
@@ -17,24 +13,16 @@ MAX_TURNOS_DIA = 2
 
 st.sidebar.markdown("---")
 st.sidebar.header("Carregamento de dados")
-st.sidebar.caption("Carregue um ZIP com todos os CSVs **ou** ficheiros individuais.")
+st.sidebar.caption("Carregue um ZIP com todos os ficheiros (CSV/XLSX) **ou** ficheiros individuais.")
 
-# ============================================================
-# Schemas
-# ============================================================
 REQUIRED = {
     "docentes": ["id","nome","grupo","reducao79_min"],
     "turmas": ["id","ciclo","ano","curso","n_alunos","escola"],
     "funcoes": ["docente_id","tipo","horas_sem"],
     "horarios": ["docente_id","dia","inicio","fim","tipo","local","turma_id","disciplina"],
 }
-OPTIONAL = {
-    "matriz": ["ciclo","ano","disciplina","carga_sem_min"]
-}
+OPTIONAL = {"matriz": ["ciclo","ano","disciplina","carga_sem_min"]}
 
-# ============================================================
-# Helpers
-# ============================================================
 def normalize_ciclo(x: str):
     if not isinstance(x, str): return ""
     t = x.strip().lower()
@@ -42,8 +30,7 @@ def normalize_ciclo(x: str):
     if t.startswith("1"): return "1º"
     if t.startswith("2"): return "2º"
     if t.startswith("3"): return "3º"
-    if t.startswith("sec"): return "Sec"
-    if "secund" in t: return "Sec"
+    if t.startswith("sec") or "secund" in t: return "Sec"
     return x
 
 def mins_between(h1, h2):
@@ -54,12 +41,75 @@ def mins_between(h1, h2):
     except Exception:
         return 0
 
-def read_csv_bytes(file):
-    try:
-        return pd.read_csv(file)
-    except Exception as e:
-        st.error(f"Erro ao ler CSV ({getattr(file,'name','upload')}): {e}")
-        return None
+def _normalize_token(s: str) -> str:
+    if not isinstance(s, str): s = str(s)
+    s = s.strip().lower()
+    accents = str.maketrans("áàãâéêíóôõúçºª", "aaaaeeioooucoo")
+    s = s.translate(accents)
+    s = re.sub(r"[^a-z0-9]+", "_", s)
+    return s.strip("_")
+
+SYNONYMS = {
+    "id": ["id","codigo","cod","docente_id"],
+    "nome": ["nome","docente","professor","nome_docente"],
+    "grupo": ["grupo","grupo_recrutamento","grupo_de_recrutamento","grupo_recrut"],
+    "reducao79_min": ["reducao79_min","reducao79","reducao_art79_min","reducao_art_79_min"],
+    "ciclo": ["ciclo"],
+    "ano": ["ano","ano_escolaridade","ano_de_escolaridade"],
+    "curso": ["curso"],
+    "n_alunos": ["n_alunos","numero_alunos","num_alunos","n__alunos","n_aluno","n_de_alunos"],
+    "escola": ["escola","estabelecimento","edificio"],
+    "tipo": ["tipo","funcao","cargo"],
+    "horas_sem": ["horas_sem","horas","horas_semanais","h_sem"],
+    "dia": ["dia","dia_semana"],
+    "inicio": ["inicio","hora_inicio","inicio_hora","inicio_"],
+    "fim": ["fim","hora_fim","fim_hora","termino"],
+    "local": ["local","escola","edificio","sala"],
+    "turma_id": ["turma_id","turma","id_turma"],
+    "disciplina": ["disciplina","dis"],
+    "carga_sem_min": ["carga_sem_min","carga_horaria_min_sem","carga","carga_sem"],
+}
+
+def smart_rename(df: pd.DataFrame, expected_cols: list) -> pd.DataFrame:
+    rename_map = {}
+    norm_to_orig = {_normalize_token(c): c for c in df.columns}
+    for exp in expected_cols:
+        candidates = [exp] + SYNONYMS.get(exp, [])
+        candidates = [_normalize_token(c) for c in candidates]
+        for cand in candidates:
+            if cand in norm_to_orig:
+                rename_map[norm_to_orig[cand]] = exp
+                break
+    return df.rename(columns=rename_map).copy()
+
+def read_table_from_bytes(data: bytes, filename: str):
+    name = (filename or "").lower()
+    if name.endswith(".xlsx") or name.endswith(".xls"):
+        try:
+            return pd.read_excel(io.BytesIO(data))
+        except Exception as e:
+            st.error(f"Erro a ler Excel {filename}: {e}")
+            return None
+    encodings = ["utf-8", "utf-8-sig", "cp1252", "latin-1"]
+    seps = [None, ";", ",", "\t", "|"]
+    for enc in encodings:
+        for sep in seps:
+            try:
+                bio = io.BytesIO(data)
+                if sep is None:
+                    df = pd.read_csv(bio, sep=None, engine="python", encoding=enc)
+                else:
+                    df = pd.read_csv(bio, sep=sep, engine="python", encoding=enc)
+                if len(df.columns) >= 1:
+                    return df
+            except Exception:
+                continue
+    st.error(f"Não foi possível ler o ficheiro {filename}.")
+    return None
+
+def read_uploaded(file):
+    data = file.read()
+    return read_table_from_bytes(data, getattr(file, "name", "upload"))
 
 def load_from_zip(zip_bytes):
     datasets = {}
@@ -67,23 +117,27 @@ def load_from_zip(zip_bytes):
         with zipfile.ZipFile(io.BytesIO(zip_bytes), 'r') as z:
             names = z.namelist()
             for key in list(REQUIRED.keys()) + list(OPTIONAL.keys()):
-                candidates = [f"{key}.csv", f"{key}.CSV"]
-                member = next((n for n in names if n in candidates or n.endswith(f"/{key}.csv") or n.endswith(f"/{key}.CSV")), None)
-                if member:
-                    with z.open(member) as f:
-                        datasets[key] = pd.read_csv(f)
+                match = None
+                for n in names:
+                    base = os.path.basename(n).lower()
+                    if base in {f"{key}.csv", f"{key}.xlsx", f"{key}.xls"}:
+                        match = n; break
+                if match:
+                    data = z.read(match)
+                    df = read_table_from_bytes(data, match)
+                    if df is not None:
+                        datasets[key] = df
     except Exception as e:
         st.error(f"Erro ao ler ZIP: {e}")
     return datasets
 
 def validate_schema(df, name, optional=False):
-    cols = (OPTIONAL if optional else REQUIRED)[name]
-    missing = [c for c in cols if c not in df.columns]
-    return missing
+    exp = (OPTIONAL if optional else REQUIRED)[name]
+    df2 = smart_rename(df, exp)
+    missing = [c for c in exp if c not in df2.columns]
+    return missing, df2
 
-# ============================================================
-# Defaults (exemplo)
-# ============================================================
+# Defaults
 docentes_def = pd.DataFrame([
     {"id":"D1","nome":"Ana Silva","grupo":"110","reducao79_min":0},
     {"id":"D2","nome":"Bruno Sousa","grupo":"510","reducao79_min":110},
@@ -110,92 +164,90 @@ matriz_def = pd.DataFrame([
     {"ciclo":"Sec","ano":10,"disciplina":"Física","carga_sem_min":150},
 ])
 
-# ============================================================
 # Uploads
-# ============================================================
-zip_upload = st.file_uploader("ZIP com docentes.csv, turmas.csv, funcoes.csv, horarios.csv (e opcionalmente matriz.csv)", type=["zip"])
+zip_upload = st.file_uploader("ZIP com docentes/turmas/funcoes/horarios (e opcionalmente matriz) — CSV ou Excel", type=["zip"])
 uploaded = {}
 if zip_upload is not None:
     uploaded.update(load_from_zip(zip_upload.read()))
 
 c1, c2 = st.columns(2)
 with c1:
-    up_docentes = st.file_uploader("docentes.csv", type=["csv"], key="docentes_up")
-    up_turmas   = st.file_uploader("turmas.csv", type=["csv"], key="turmas_up")
-    up_matriz   = st.file_uploader("matriz.csv (opcional)", type=["csv"], key="matriz_up")
+    up_docentes = st.file_uploader("docentes (CSV/XLSX)", type=["csv","xlsx","xls"], key="docentes_up")
+    up_turmas   = st.file_uploader("turmas (CSV/XLSX)",   type=["csv","xlsx","xls"], key="turmas_up")
+    up_matriz   = st.file_uploader("matriz (opcional)",    type=["csv","xlsx","xls"], key="matriz_up")
 with c2:
-    up_funcoes  = st.file_uploader("funcoes.csv", type=["csv"], key="funcoes_up")
-    up_horarios = st.file_uploader("horarios.csv", type=["csv"], key="horarios_up")
+    up_funcoes  = st.file_uploader("funcoes (CSV/XLSX)",  type=["csv","xlsx","xls"], key="funcoes_up")
+    up_horarios = st.file_uploader("horarios (CSV/XLSX)", type=["csv","xlsx","xls"], key="horarios_up")
 
-if up_docentes: uploaded["docentes"] = read_csv_bytes(up_docentes)
-if up_turmas:   uploaded["turmas"]   = read_csv_bytes(up_turmas)
-if up_funcoes:  uploaded["funcoes"]  = read_csv_bytes(up_funcoes)
-if up_horarios: uploaded["horarios"] = read_csv_bytes(up_horarios)
-if up_matriz:   uploaded["matriz"]   = read_csv_bytes(up_matriz)
+if up_docentes: uploaded["docentes"] = read_uploaded(up_docentes)
+if up_turmas:   uploaded["turmas"]   = read_uploaded(up_turmas)
+if up_funcoes:  uploaded["funcoes"]  = read_uploaded(up_funcoes)
+if up_horarios: uploaded["horarios"] = read_uploaded(up_horarios)
+if up_matriz:   uploaded["matriz"]   = read_uploaded(up_matriz)
 
-docentes = uploaded.get("docentes", docentes_def).copy()
-turmas   = uploaded.get("turmas", turmas_def).copy()
-funcoes  = uploaded.get("funcoes", funcoes_def).copy()
-horarios = uploaded.get("horarios", horarios_def).copy()
-matriz   = uploaded.get("matriz", matriz_def).copy()
+docentes_raw = uploaded.get("docentes", docentes_def)
+turmas_raw   = uploaded.get("turmas", turmas_def)
+funcoes_raw  = uploaded.get("funcoes", funcoes_def)
+horarios_raw = uploaded.get("horarios", horarios_def)
+matriz_raw   = uploaded.get("matriz", matriz_def)
 
-# Normalize ciclos
-if "ciclo" in turmas.columns:
-    turmas["ciclo"] = turmas["ciclo"].map(normalize_ciclo)
-if "ciclo" in matriz.columns:
-    matriz["ciclo"] = matriz["ciclo"].map(normalize_ciclo)
+if "ciclo" in turmas_raw.columns:
+    turmas_raw["ciclo"] = turmas_raw["ciclo"].map(normalize_ciclo)
+if "ciclo" in matriz_raw.columns:
+    matriz_raw["ciclo"] = matriz_raw["ciclo"].map(normalize_ciclo)
 
-# Validate schemas
 problems = []
-for name, df in [("docentes", docentes), ("turmas", turmas), ("funcoes", funcoes), ("horarios", horarios)]:
-    miss = validate_schema(df, name)
-    if miss: problems.append(f"{name}.csv: faltam colunas {miss}")
-if not matriz.empty:
-    miss = validate_schema(matriz, "matriz", optional=True)
-    if miss: problems.append(f"matriz.csv: faltam colunas {miss}")
+docentes_miss, docentes = validate_schema(docentes_raw, "docentes")
+turmas_miss,   turmas   = validate_schema(turmas_raw, "turmas")
+funcoes_miss,  funcoes  = validate_schema(funcoes_raw, "funcoes")
+horarios_miss, horarios = validate_schema(horarios_raw, "horarios")
+matriz_miss,   matriz   = validate_schema(matriz_raw, "matriz", optional=True)
+
+if docentes_miss: problems.append(f"docentes: faltam colunas {docentes_miss}")
+if turmas_miss:   problems.append(f"turmas: faltam colunas {turmas_miss}")
+if funcoes_miss:  problems.append(f"funcoes: faltam colunas {funcoes_miss}")
+if horarios_miss: problems.append(f"horarios: faltam colunas {horarios_miss}")
+if matriz_miss:   problems.append(f"matriz: faltam colunas {matriz_miss}")
+
+with st.expander("Ficheiros detetados e pré-visualização"):
+    shapes = {k:v.shape for k,v in [("docentes",docentes),("turmas",turmas),("funcoes",funcoes),("horarios",horarios),("matriz",matriz)] if isinstance(v,pd.DataFrame)}
+    st.write("Dimensões:", shapes)
+    st.write("**docentes**", docentes.head())
+    st.write("**turmas**", turmas.head())
+    st.write("**funcoes**", funcoes.head())
+    st.write("**horarios**", horarios.head())
+    if isinstance(matriz, pd.DataFrame) and not matriz.empty:
+        st.write("**matriz**", matriz.head())
+
 if problems:
     st.error("⚠️ Problemas nos ficheiros:")
     for p in problems: st.write("- ", p)
     st.stop()
 
-with st.expander("Pré-visualização"):
-    st.write("**docentes**", docentes.head())
-    st.write("**turmas**", turmas.head())
-    st.write("**funcoes**", funcoes.head())
-    st.write("**horarios**", horarios.head())
-    if not matriz.empty: st.write("**matriz**", matriz.head())
-
-# ============================================================
-# Métricas globais (Crédito horário – estimativa)
-# ============================================================
+# Métricas globais
 n_turmas = len(turmas)
 horas79_total = (docentes["reducao79_min"].sum() / 60.0) if "reducao79_min" in docentes else 0
 CH_calc = (10 if TEIP else 7)*n_turmas - 0.5*horas79_total
 dt_horas = funcoes.query("tipo=='DT'")["horas_sem"].sum() if not funcoes.empty else 0
-ch_usado = max(0, dt_horas*0.5)  # mínimo 2h em CH para DT
+ch_usado = max(0, dt_horas*0.5)
 ch_saldo = CH_calc - ch_usado
 
-st.title("Distribuição de Serviço Docente — App Completa")
+st.title("Distribuição de Serviço Docente — Versão Robusta (uploads)")
 m1, m2, m3, m4 = st.columns(4)
 m1.metric("N.º turmas", n_turmas)
 m2.metric("Crédito Horário (estim.)", f"{CH_calc:.1f} h/sem")
 m3.metric("CH usado (DT mínimo)", f"{ch_usado:.1f} h/sem")
 m4.metric("Saldo CH", f"{ch_saldo:.1f} h/sem")
 
-# Mapas auxiliares
 turma_ciclo = turmas.set_index("id")["ciclo"].to_dict()
 turma_ano   = turmas.set_index("id")["ano"].to_dict()
 
-# ============================================================
-# Regras por docente + Mensagens de correção
-# ============================================================
 def validar_docente(docente):
     d_id = docente["id"]
     grupo = str(docente.get("grupo","")).strip()
     df = horarios[horarios["docente_id"]==d_id].copy()
     if df.empty:
         return {"alvo":"—","letiva":0,"nlet_est":0,"nlet_ind":0,"issues":["Sem horário atribuído"],"sugestoes":[]}
-    # minutos por registo
     df["min"] = df.apply(lambda r: mins_between(r["inicio"], r["fim"]), axis=1)
     letiva = int(df.loc[df["tipo"]=="LETIVA","min"].sum())
     nlet_est = int(df.loc[df["tipo"]=="NLET_EST","min"].sum())
@@ -204,7 +256,6 @@ def validar_docente(docente):
 
     issues, sug = [], []
 
-    # Blocos de 60 min no Pré/1º
     pre1 = df[(df["tipo"]=="LETIVA") & (df["turma_id"].map(lambda t: turma_ciclo.get(t,"") in ["Pré","1º"]))]
     for i, r in pre1.iterrows():
         dur = int(r["min"])
@@ -213,7 +264,6 @@ def validar_docente(docente):
             issues.append(f"Bloco não múltiplo de 60 min (Pré/1º): {r['dia']} {r['inicio']}-{r['fim']} ({dur} min)")
             sug.append(f"Acrescentar {falta} min ou ajustar para múltiplos de 60.")
 
-    # Alvo por grupo
     if grupo in ["100","110"]:
         alvo = 1500
         if letiva != alvo:
@@ -237,7 +287,6 @@ def validar_docente(docente):
             else:
                 sug.append(f"Pode acrescentar até {49 - rem} min sem ultrapassar o limite de remanescente.")
 
-    # NLet Est mínimo/cap
     if nlet_est < NLET_EST_MIN:
         issues.append(f"NLet Est abaixo do mínimo definido ({NLET_EST_MIN} min).")
         sug.append(f"Aumentar {NLET_EST_MIN - nlet_est} min na NLet Est.")
@@ -262,12 +311,8 @@ for _, d in docentes.iterrows():
         for s in v["sugestoes"]:
             st.write("- ", s)
 
-# ============================================================
-# Matriz Curricular (ciclo+ano+disciplina com fallback)
-# ============================================================
-if not matriz.empty:
+if isinstance(matriz_raw, pd.DataFrame) and not matriz_raw.empty:
     st.subheader("Conformidade com a matriz curricular (ciclo + ano + disciplina)")
-    # Somatório de minutos letivos por turma x disciplina
     letiva = horarios[horarios["tipo"]=="LETIVA"].copy()
     if not letiva.empty:
         letiva["min"] = letiva.apply(lambda r: mins_between(r["inicio"], r["fim"]), axis=1)
@@ -275,42 +320,30 @@ if not matriz.empty:
         letiva["ano"]   = letiva["turma_id"].map(lambda t: turma_ano.get(t,""))
         agg = letiva.groupby(["turma_id","ciclo","ano","disciplina"], dropna=False)["min"].sum().reset_index()
 
-        # merge exato ciclo+ano+disciplina
+        matriz = smart_rename(matriz_raw, OPTIONAL["matriz"])
+        matriz["ciclo"] = matriz["ciclo"].map(normalize_ciclo)
         rep = agg.merge(matriz, how="left", on=["ciclo","ano","disciplina"], suffixes=("","_mat"))
-        # fallback: onde carga_sem_min está NaN, tentar ciclo+disciplina (ignorando ano)
-        fallback = matriz.groupby(["ciclo","disciplina"])["carga_sem_min"].mean().reset_index().rename(columns={"carga_sem_min":"carga_fallback"})
-        rep = rep.merge(fallback, how="left", on=["ciclo","disciplina"])
+        fb = matriz.groupby(["ciclo","disciplina"])["carga_sem_min"].mean().reset_index().rename(columns={"carga_sem_min":"carga_fallback"})
+        rep = rep.merge(fb, how="left", on=["ciclo","disciplina"])
         rep["carga_ref"] = rep["carga_sem_min"].fillna(rep["carga_fallback"])
 
         def estado(row):
             if pd.isna(row["carga_ref"]): return "Sem referência"
             if row["min"] == row["carga_ref"]: return "OK"
             if row["min"] < row["carga_ref"]: return "Parcial"
-            if row["min"] > row["carga_ref"]: return "Excedido"
-            return "—"
+            return "Excedido"
 
         rep["estado"] = rep.apply(estado, axis=1)
-        show = rep[["turma_id","ciclo","ano","disciplina","min","carga_ref","estado"]].sort_values(["turma_id","disciplina"])
-        st.dataframe(show, use_container_width=True)
+        st.dataframe(rep[["turma_id","ciclo","ano","disciplina","min","carga_ref","estado"]].sort_values(["turma_id","disciplina"]), use_container_width=True)
     else:
         st.info("Sem registos letivos para verificar a matriz.")
 
 st.divider()
-with st.expander("Modelos de CSV para download"):
-    st.download_button("docentes.csv (modelo)",
-        pd.DataFrame(columns=REQUIRED["docentes"]).to_csv(index=False).encode(),
-        "docentes.csv","text/csv")
-    st.download_button("turmas.csv (modelo)",
-        pd.DataFrame(columns=REQUIRED["turmas"]).to_csv(index=False).encode(),
-        "turmas.csv","text/csv")
-    st.download_button("funcoes.csv (modelo)",
-        pd.DataFrame(columns=REQUIRED["funcoes"]).to_csv(index=False).encode(),
-        "funcoes.csv","text/csv")
-    st.download_button("horarios.csv (modelo)",
-        pd.DataFrame(columns=REQUIRED["horarios"]).to_csv(index=False).encode(),
-        "horarios.csv","text/csv")
-    st.download_button("matriz.csv (modelo)",
-        pd.DataFrame(columns=OPTIONAL["matriz"]).to_csv(index=False).encode(),
-        "matriz.csv","text/csv")
+with st.expander("Modelos de ficheiros para download"):
+    st.download_button("docentes (modelo)", pd.DataFrame(columns=REQUIRED["docentes"]).to_csv(index=False).encode(), "docentes.csv","text/csv")
+    st.download_button("turmas (modelo)",   pd.DataFrame(columns=REQUIRED["turmas"]).to_csv(index=False).encode(), "turmas.csv","text/csv")
+    st.download_button("funcoes (modelo)",  pd.DataFrame(columns=REQUIRED["funcoes"]).to_csv(index=False).encode(), "funcoes.csv","text/csv")
+    st.download_button("horarios (modelo)", pd.DataFrame(columns=REQUIRED["horarios"]).to_csv(index=False).encode(), "horarios.csv","text/csv")
+    st.download_button("matriz (modelo)",   pd.DataFrame(columns=OPTIONAL["matriz"]).to_csv(index=False).encode(), "matriz.csv","text/csv")
 
-st.caption("Regras: grupos 100/110 = 1500 min exatos; restantes ≤1100 min (remanescente < 50); blocos de 60 min no Pré/1º; NLet Est máximo 150 min; matriz por ciclo+ano+disciplina.")
+st.caption("Uploads robustos: aceita CSV/Excel; nomes insensíveis a maiúsculas; deteção de separador/codificação; normalização de cabeçalhos.")
