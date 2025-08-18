@@ -3,7 +3,7 @@ import streamlit as st
 import pandas as pd
 import io, re
 
-st.set_page_config(page_title="Distribuição de Serviço Docente — Cargos (robusto)", layout="wide")
+st.set_page_config(page_title="Distribuição de Serviço Docente — Cargos (robusto v2)", layout="wide")
 
 # =========================
 # Robust CSV loader + column normalization
@@ -38,8 +38,7 @@ def normalize_cols(df):
     for c in df.columns:
         key = re.sub(r'[^a-z0-9]+','', str(c).strip().lower())
         mapping[c] = key
-    df = df.rename(columns=mapping)
-    return df
+    return df.rename(columns=mapping)
 
 ALIASES_DOCENTES = {
     "id": ["id","docenteid","codigo","cod","id_docente","iddocente","num","numero","nº","mecanografico"],
@@ -55,28 +54,25 @@ ALIASES_CARGOS = {
 
 def apply_aliases(df, aliases):
     cols = set(df.columns)
-    new_names = {}
-    for canonical, choices in aliases.items():
-        found = None
-        for a in choices:
+    ren = {}
+    for canon, alts in aliases.items():
+        if canon in cols:
+            continue
+        for a in alts:
             if a in cols:
-                found = a
+                ren[a] = canon
                 break
-        if found and found != canonical:
-            new_names[found] = canonical
-    if new_names:
-        df = df.rename(columns=new_names)
+    if ren:
+        df = df.rename(columns=ren)
     return df
 
-def ensure_columns(df, required, fallback_by_position=None, label=""):
+def ensure_columns(df, required, label=""):
+    for c in required:
+        if c not in df.columns:
+            df[c] = "" if c not in ("reducao79_min","carga_min") else 0
     missing = [c for c in required if c not in df.columns]
-    if missing and fallback_by_position:
-        for i, cname in fallback_by_position.items():
-            if 0 <= i < df.shape[1] and cname in missing:
-                df[cname] = df.iloc[:, i]
-        missing = [c for c in required if c not in df.columns]
     if missing:
-        st.warning(f"{label}: faltam colunas {missing}. Verifique o cabeçalho do CSV.")
+        st.warning(f"{label}: faltam colunas {missing}.")
     return df
 
 # =========================
@@ -109,16 +105,18 @@ st.session_state.te_global = st.sidebar.slider("Trabalho de Escola (TE) — glob
 st.session_state.credito_total = st.sidebar.number_input("Crédito LETIVA total (min)", value=st.session_state.credito_total, step=10)
 
 # =========================
-# Carregar dados (com robustez)
+# Carregar dados (robusto)
 # =========================
 if up_doc is not None:
     docentes = read_csv_robust(up_doc)
 else:
-    docentes = pd.DataFrame([{"id":"D1","nome":"Ana Silva","grupo":"510","reducao79_min":0}])
+    docentes = pd.DataFrame([{"id":"D1","nome":"Ana Silva","grupo":"510","reducao79_min":0},
+                             {"id":"D2","nome":"Bruno Sousa","grupo":"520","reducao79_min":0},
+                             {"id":"Pre1","nome":"Carla Reis","grupo":"100","reducao79_min":0}])
 
 docentes = normalize_cols(docentes)
 docentes = apply_aliases(docentes, ALIASES_DOCENTES)
-docentes = ensure_columns(docentes, ["id","nome","grupo","reducao79_min"], {0:"id",1:"nome"}, label="docentes.csv")
+docentes = ensure_columns(docentes, ["id","nome","grupo","reducao79_min"], label="docentes.csv")
 
 if up_car is not None:
     cargos = read_csv_robust(up_car)
@@ -126,11 +124,12 @@ else:
     cargos = pd.DataFrame([
         {"id":"C1","cargo":"Diretor de Turma","carga_min":45},
         {"id":"C2","cargo":"Coordenador de Departamento","carga_min":90},
+        {"id":"C3","cargo":"Adjunto de Direção","carga_min":150},
     ])
 
 cargos = normalize_cols(cargos)
 cargos = apply_aliases(cargos, ALIASES_CARGOS)
-cargos = ensure_columns(cargos, ["id","cargo","carga_min"], {0:"id",1:"cargo",2:"carga_min"}, label="cargos.csv")
+cargos = ensure_columns(cargos, ["id","cargo","carga_min"], label="cargos.csv")
 
 # =========================
 # Gestão de Cargos
@@ -138,10 +137,8 @@ cargos = ensure_columns(cargos, ["id","cargo","carga_min"], {0:"id",1:"cargo",2:
 st.title("Gestão de Cargos")
 st.caption("Atribua cargos aos docentes e escolha a imputação (LETIVA / ART79 / TE).")
 
-docentes_ids = docentes["id"] if "id" in docentes.columns else docentes.iloc[:,0]
-docentes_ids = [""] + list(docentes_ids.astype(str).unique())
+docentes_ids = [""] + list(docentes["id"].astype(str).unique())
 
-edit_cols = ["id","cargo","carga_min","docente_id","imputacao"]
 base = cargos.copy()
 if "docente_id" not in base.columns:
     base["docente_id"] = ""
@@ -155,8 +152,7 @@ edited = st.data_editor(
         "imputacao": st.column_config.SelectboxColumn("Imputação", options=["LETIVA","ART79","TE"]),
         "carga_min": st.column_config.NumberColumn("Carga (min)", min_value=0, step=5),
     },
-    hide_index=True,
-    use_container_width=True
+    hide_index=True, use_container_width=True
 )
 
 c1, c2 = st.columns(2)
@@ -169,7 +165,7 @@ with c2:
         st.session_state.cargos_atr = []
         st.info("Atribuições de cargos limpas.")
 
-atr = pd.DataFrame(st.session_state.cargos_atr) if st.session_state.cargos_atr else pd.DataFrame(columns=edit_cols)
+atr = pd.DataFrame(st.session_state.cargos_atr) if st.session_state.cargos_atr else pd.DataFrame(columns=["id","cargo","carga_min","docente_id","imputacao"])
 st.subheader("Cargos atribuídos (estado atual)")
 st.dataframe(atr, use_container_width=True)
 
@@ -180,36 +176,50 @@ gasto_letiva = 0
 if not atr.empty:
     tmp = atr.copy()
     tmp["carga_min"] = pd.to_numeric(tmp["carga_min"], errors="coerce").fillna(0).astype(int)
-    gasto_letiva = tmp[tmp["imputacao"]=="LETIVA"]["carga_min"].sum()
+    gasto_letiva = int(tmp[tmp["imputacao"].str.upper()=="LETIVA"]["carga_min"].sum())
 
-st.sidebar.metric("Crédito LETIVA — total", st.session_state.credito_total)
+st.sidebar.metric("Crédito LETIVA — total", int(st.session_state.credito_total))
 st.sidebar.metric("Crédito LETIVA — gasto (cargos LETIVA)", int(gasto_letiva))
 st.sidebar.metric("Crédito LETIVA — restante", int(st.session_state.credito_total - gasto_letiva))
 
 # =========================
-# Cargas por docente (efeito dos cargos)
+# Cargas por docente (inclui cargos) — FIX v2
 # =========================
 st.markdown("---")
 st.header("Cargas por docente (inclui cargos)")
+
 res = docentes.copy()
+
+# Garantir colunas base
+for col in ["id","nome","grupo"]:
+    if col not in res.columns:
+        res[col] = ""
+
+# Art.79 base
+if "reducao79_min" not in res.columns:
+    res["reducao79_min"] = 0
+res["reducao79_min"] = pd.to_numeric(res["reducao79_min"], errors="coerce").fillna(0).astype(int)
+
+# Iniciar métricas
 res["letiva_atr_min"] = 0
-res["art79_min"] = pd.to_numeric(res.get("reducao79_min", 0), errors="coerce").fillna(0).astype(int)
+res["art79_min"] = res["reducao79_min"]
 res["te_min"] = int(st.session_state.te_global)
 
+# Acrescentar cargos
 if not atr.empty:
-    for _, r in atr.iterrows():
+    atr2 = atr.copy()
+    atr2["carga_min"] = pd.to_numeric(atr2["carga_min"], errors="coerce").fillna(0).astype(int)
+    atr2["imputacao"] = atr2["imputacao"].astype(str).str.upper()
+    for _, r in atr2.iterrows():
         did = str(r.get("docente_id","")).strip()
-        carga = int(pd.to_numeric(r.get("carga_min",0), errors="coerce"))
-        imp = str(r.get("imputacao","LETIVA")).upper()
-        if did == "" or carga == 0: 
+        if did == "" or r["carga_min"] == 0:
             continue
-        mask = res["id"].astype(str) == did if "id" in res.columns else res.iloc[:,0].astype(str) == did
-        if imp == "LETIVA":
-            res.loc[mask, "letiva_atr_min"] += carga
-        elif imp == "ART79":
-            res.loc[mask, "art79_min"] += carga
-        elif imp == "TE":
-            res.loc[mask, "te_min"] += carga
+        mask = res["id"].astype(str) == did
+        if r["imputacao"] == "LETIVA":
+            res.loc[mask, "letiva_atr_min"] += r["carga_min"]
+        elif r["imputacao"] == "ART79":
+            res.loc[mask, "art79_min"] += r["carga_min"]
+        elif r["imputacao"] == "TE":
+            res.loc[mask, "te_min"] += r["carga_min"]
 
-res = res.rename(columns={"reducao79_min":"reducao79_base_min"})
-st.dataframe(res[["id","nome","grupo","letiva_atr_min","reducao79_base_min","art79_min","te_min"]], use_container_width=True)
+st.dataframe(res[["id","nome","grupo","letiva_atr_min","art79_min","te_min"]], use_container_width=True)
